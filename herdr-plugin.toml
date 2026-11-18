@@ -1,0 +1,75 @@
+# Herdr ⇄ WeCom (企业微信): agent notifications and two-way control through a
+# WeCom AI bot over its long-connection WebSocket gateway.
+# Every entrypoint runs bin/herdr-wecom with a subcommand.
+
+id = "crazyhulk.wecom"
+name = "WeCom Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "企业微信机器人：agent 等待/完成通知，聊天中回复、发按键、新建 agent。"
+platforms = ["linux", "macos"]
+
+# Builds bin/herdr-wecom from source (needs Go). `herdr plugin link` skips
+# this; run `make build` instead.
+[[build]]
+command = ["sh", "scripts/build.sh"]
+platforms = ["linux", "macos"]
+
+# Starts the daemon after Herdr starts when configured.
+[[startup]]
+command = ["bin/herdr-wecom", "startup"]
+
+[[actions]]
+id = "setup"
+title = "WeCom: setup"
+command = ["bin/herdr-wecom", "action", "setup"]
+
+[[actions]]
+id = "pair"
+title = "WeCom: new pairing code"
+command = ["bin/herdr-wecom", "action", "pair"]
+
+[[actions]]
+id = "start"
+title = "WeCom: start"
+command = ["bin/herdr-wecom", "action", "start"]
+
+[[actions]]
+id = "stop"
+title = "WeCom: stop"
+command = ["bin/herdr-wecom", "action", "stop"]
+
+[[actions]]
+id = "restart"
+title = "WeCom: restart"
+command = ["bin/herdr-wecom", "action", "restart"]
+
+[[actions]]
+id = "status"
+title = "WeCom: status"
+command = ["bin/herdr-wecom", "action", "status"]
+
+[[actions]]
+id = "send-test"
+title = "WeCom: send test message"
+command = ["bin/herdr-wecom", "action", "send-test"]
+
+[[actions]]
+id = "logs"
+title = "WeCom: logs"
+command = ["bin/herdr-wecom", "action", "logs"]
+
+# Pane commands are looked up in PATH; the actions pass PATH=<root>:$PATH.
+[[panes]]
+id = "setup"
+title = "WeCom setup"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["bin/herdr-wecom", "setup-pane"]
+
+[[panes]]
+id = "logs"
+title = "WeCom logs"
+placement = "overlay"
+command = ["bin/herdr-wecom", "logs-pane"]

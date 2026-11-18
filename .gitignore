@@ -1,2 +1,4 @@
 herdr-telegram-agents
 herdr-notifications
+bin/
+*.tmp
