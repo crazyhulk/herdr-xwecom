@@ -248,7 +248,10 @@ func (b *Bridge) probeStalled(ctx context.Context, now time.Time) {
 			continue
 		}
 		idle := screen.LooksIdle(text)
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
+		// Fingerprint only the conversation above the input frame: the
+		// status line and teammate list below it carry clocks that tick
+		// every minute and are not agent activity.
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(screen.TrimInputFrame(text))))
 		var fire *herdr.Agent
 		var worked time.Duration
 		b.mu.Lock()
@@ -459,9 +462,11 @@ func (b *Bridge) post(ctx context.Context, a herdr.Agent, kind string, worked ti
 	if strings.TrimSpace(text) != "" {
 		body += "\n```\n" + text + "\n```"
 	}
+	// Dedupe on the captured screen, not the head: the head carries the
+	// turn duration, which differs between two posts of the same screen.
 	b.mu.Lock()
-	dup := b.lastPost[a.PaneID] == body
-	b.lastPost[a.PaneID] = body
+	dup := text != "" && b.lastPost[a.PaneID] == text
+	b.lastPost[a.PaneID] = text
 	b.mu.Unlock()
 	if dup {
 		b.Log.Info("post skipped", "pane", a.PaneID, "kind", kind, "why", "same as last post")

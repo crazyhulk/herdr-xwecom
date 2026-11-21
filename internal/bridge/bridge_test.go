@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -268,4 +269,23 @@ func TestStuckWorkingRearmsOnActivity(t *testing.T) {
 	show(second)
 	show(second)
 	waitFor(t, func() bool { return strings.Count(w.all(), "已完成") == 2 })
+}
+
+func TestStuckWorkingIgnoresTickingStatusArea(t *testing.T) {
+	b, h, w := setup(t)
+	b.StaleAfter, b.ProbeEvery = 0, 0
+	h.set("working", "idle")
+	b.Poll(context.Background())
+	// Same conversation; only the teammate clock under the frame ticks.
+	for i := 0; i < 6; i++ {
+		h.mu.Lock()
+		h.screen = idleScreen + fmt.Sprintf("\n\n  ⏺ main\n  ◯ xw-dev2   Clear tool lines   5d 2h %dm", 30+i)
+		h.mu.Unlock()
+		b.Poll(context.Background())
+		b.Poll(context.Background())
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := strings.Count(w.all(), "已完成"); n != 1 {
+		t.Fatalf("want one post, got %d:\n%s", n, w.all())
+	}
 }
