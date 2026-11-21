@@ -12,6 +12,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -61,6 +62,14 @@ type paneTrack struct {
 	status       string
 	since        time.Time
 	workingSince time.Time
+
+	// Fallback for a Herdr status stuck at "working" while the screen is
+	// waiting for input (e.g. Claude Code keeps the spinner in its title
+	// while teammates live): screen fingerprint, when it last changed, and
+	// whether the stall was already reported as done.
+	screenHash  string
+	screenSince time.Time
+	stale       bool
 }
 
 type cardState struct {
@@ -77,6 +86,8 @@ type Bridge struct {
 	State *config.State
 	Log   *slog.Logger
 
+	pollErr string // last poll error, logged once per change
+
 	mu       sync.Mutex
 	agents   map[string]herdr.Agent // pane id -> agent
 	track    map[string]*paneTrack
@@ -86,13 +97,20 @@ type Bridge struct {
 	lastPost map[string]string    // pane id -> last posted body (dedupe)
 	wsLabels map[string]string
 	cardSeq  int64
+
+	// StaleAfter is how long a "working" agent's screen must look idle and
+	// unchanged before it is reported as done; ProbeEvery is the probe rate.
+	StaleAfter time.Duration
+	ProbeEvery time.Duration
+	lastProbe  time.Time
 }
 
 // New builds a bridge.
 func New(h Herdr, w Sender, cfg func() config.Config, st *config.State, log *slog.Logger) *Bridge {
 	return &Bridge{H: h, W: w, Cfg: cfg, State: st, Log: log,
 		agents: map[string]herdr.Agent{}, track: map[string]*paneTrack{},
-		cards: map[string]cardState{}, lastCard: map[string]string{}, lastPost: map[string]string{}, wsLabels: map[string]string{}}
+		cards: map[string]cardState{}, lastCard: map[string]string{}, lastPost: map[string]string{}, wsLabels: map[string]string{},
+		StaleAfter: 30 * time.Second, ProbeEvery: 5 * time.Second}
 }
 
 // Run polls Herdr until ctx ends.
@@ -100,8 +118,14 @@ func (b *Bridge) Run(ctx context.Context) {
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
 	for {
-		if err := b.Poll(ctx); err != nil {
-			b.Log.Debug("poll failed", "err", err)
+		err := b.Poll(ctx)
+		switch {
+		case err != nil && err.Error() != b.pollErr:
+			b.pollErr = err.Error()
+			b.Log.Warn("poll failed", "err", err)
+		case err == nil && b.pollErr != "":
+			b.pollErr = ""
+			b.Log.Info("poll recovered")
 		}
 		select {
 		case <-ctx.Done():
@@ -156,7 +180,10 @@ func (b *Bridge) Poll(ctx context.Context) error {
 			continue
 		}
 		prev := tr.status
+		wasStale := tr.stale
 		tr.status, tr.since = a.Status, now
+		tr.stale, tr.screenHash = false, ""
+		b.Log.Info("transition", "pane", a.PaneID, "from", prev, "to", a.Status)
 		switch a.Status {
 		case "working":
 			if prev != "blocked" || tr.workingSince.IsZero() {
@@ -165,7 +192,10 @@ func (b *Bridge) Poll(ctx context.Context) error {
 		case "blocked":
 			fires = append(fires, fire{a, "blocked", 0})
 		case "done", "idle":
-			if prev == "working" || prev == "blocked" {
+			if wasStale {
+				// The stall fallback already reported this turn.
+				tr.workingSince = time.Time{}
+			} else if prev == "working" || prev == "blocked" {
 				var worked time.Duration
 				if !tr.workingSince.IsZero() {
 					worked = now.Sub(tr.workingSince)
@@ -192,7 +222,69 @@ func (b *Bridge) Poll(ctx context.Context) error {
 	for _, f := range fires {
 		go b.post(ctx, f.agent, f.kind, f.worked)
 	}
+	b.probeStalled(ctx, now)
 	return nil
+}
+
+// probeStalled reads the screen of every agent Herdr reports as working.
+// A screen that looks idle and stays unchanged for StaleAfter is reported
+// once as done; a change on screen re-arms it for the next turn.
+func (b *Bridge) probeStalled(ctx context.Context, now time.Time) {
+	if now.Sub(b.lastProbe) < b.ProbeEvery {
+		return
+	}
+	b.lastProbe = now
+	b.mu.Lock()
+	var working []string
+	for id, tr := range b.track {
+		if tr.status == "working" {
+			working = append(working, id)
+		}
+	}
+	b.mu.Unlock()
+	for _, id := range working {
+		text, err := b.H.Read(ctx, id, "visible", 0)
+		if err != nil {
+			continue
+		}
+		idle := screen.LooksIdle(text)
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
+		var fire *herdr.Agent
+		var worked time.Duration
+		b.mu.Lock()
+		tr, ok := b.track[id]
+		if ok && tr.status == "working" {
+			switch {
+			case !idle || hash != tr.screenHash:
+				if tr.stale && hash != tr.screenHash {
+					// Activity again after a reported stall: a new turn.
+					tr.stale = false
+					tr.workingSince = now
+				}
+				tr.screenHash, tr.screenSince = hash, now
+			case !tr.stale && now.Sub(tr.screenSince) >= b.StaleAfter:
+				tr.stale = true
+				if !tr.workingSince.IsZero() {
+					worked = tr.screenSince.Sub(tr.workingSince)
+				}
+				a := b.agents[id]
+				fire = &a
+			}
+		}
+		b.mu.Unlock()
+		if fire != nil {
+			b.Log.Info("herdr reports working but the screen is idle; reporting done", "pane", id, "unchanged_for", fmtDur(b.StaleAfter))
+			go b.post(ctx, *fire, "done", worked)
+		}
+	}
+}
+
+// stalled reports whether the fallback considers the agent finished.
+func (b *Bridge) stalled(paneID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tr, ok := b.track[paneID]
+	return ok && tr.stale
 }
 
 func (b *Bridge) retireCardLocked(paneID string) {
@@ -339,16 +431,19 @@ func (b *Bridge) post(ctx context.Context, a herdr.Agent, kind string, worked ti
 		}
 	}
 	if b.muted() {
+		b.Log.Info("post skipped", "pane", a.PaneID, "kind", kind, "why", "muted")
 		return
 	}
 	users := config.HomeUsers(cfg, b.State)
 	if len(users) == 0 {
+		b.Log.Info("post skipped", "pane", a.PaneID, "kind", kind, "why", "no home users")
 		return
 	}
 	if kind == "blocked" {
 		time.Sleep(blockedSettle)
 		if cur, ok := b.agent(a.PaneID); !ok || cur.Status != "blocked" {
-			return // answered meanwhile
+			b.Log.Info("post skipped", "pane", a.PaneID, "kind", kind, "why", "answered meanwhile")
+			return
 		}
 	}
 	text, err := b.capture(ctx, a.PaneID, kind, cfg.Notify.ScreenLines)
@@ -369,6 +464,7 @@ func (b *Bridge) post(ctx context.Context, a herdr.Agent, kind string, worked ti
 	b.lastPost[a.PaneID] = body
 	b.mu.Unlock()
 	if dup {
+		b.Log.Info("post skipped", "pane", a.PaneID, "kind", kind, "why", "same as last post")
 		return
 	}
 	hint := fmt.Sprintf("\n> 引用本消息回复，或发送 `#%d 内容` 回复该 agent", b.number(a.PaneID))

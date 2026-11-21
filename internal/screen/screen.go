@@ -7,14 +7,51 @@ import (
 	"unicode/utf8"
 )
 
-// isRule reports a horizontal rule line (Claude Code's input frame).
+// isRule reports a horizontal rule line (Claude Code's input frame). The
+// top rule may carry a label ("─── View teammates: … ─"), so a line counts
+// when it starts with a rule run of 10+ characters.
 func isRule(line string) bool {
 	t := strings.TrimSpace(line)
-	if utf8.RuneCountInString(t) < 10 {
+	run := 0
+	for _, r := range t {
+		if r != '─' && r != '━' && r != '═' {
+			break
+		}
+		run++
+	}
+	return run >= 10
+}
+
+// isEmptyPrompt reports Claude Code's empty input row.
+func isEmptyPrompt(line string) bool {
+	p := strings.TrimSpace(line)
+	return p == "❯" || p == ">" || p == "›"
+}
+
+var spinnerLine = regexp.MustCompile(`…\s*\(\d+[smh]`)
+
+// LooksIdle reports a Claude-style screen that is waiting for input: an
+// input frame with an empty prompt at the bottom and no sign of a running
+// turn ("esc to interrupt" in the status line or a "Thinking… (12s" spinner).
+// It must see the raw capture (status lines included).
+func LooksIdle(text string) bool {
+	lines := strings.Split(strings.TrimRight(text, "\n "), "\n")
+	frame := false
+	for i := max(0, len(lines)-12); i < len(lines)-1; i++ {
+		if isRule(lines[i]) && isEmptyPrompt(lines[i+1]) {
+			frame = true
+			break
+		}
+	}
+	if !frame {
 		return false
 	}
-	n := strings.Count(t, "─") + strings.Count(t, "━") + strings.Count(t, "═")
-	return n*10 >= utf8.RuneCountInString(t)*9
+	for _, l := range lines[max(0, len(lines)-20):] {
+		if strings.Contains(l, "esc to interrupt") || spinnerLine.MatchString(l) {
+			return false
+		}
+	}
+	return true
 }
 
 // TrimInputFrame removes Claude Code's empty prompt frame (two rules
@@ -31,7 +68,7 @@ func TrimInputFrame(text string) string {
 			continue
 		}
 		p := strings.TrimSpace(lines[i+1])
-		if p == "❯" || p == ">" || p == "›" || strings.HasPrefix(p, "❯ ") || strings.HasPrefix(p, "> ") {
+		if isEmptyPrompt(p) || strings.HasPrefix(p, "❯ ") || strings.HasPrefix(p, "> ") {
 			return strings.TrimRight(strings.Join(lines[:i], "\n"), "\n ")
 		}
 	}

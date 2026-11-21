@@ -31,7 +31,11 @@ func (f *fakeHerdr) ListAgents(context.Context) ([]herdr.Agent, error) {
 func (f *fakeHerdr) ListWorkspaces(context.Context) ([]herdr.Workspace, error) {
 	return []herdr.Workspace{{ID: "w1", Label: "repo"}}, nil
 }
-func (f *fakeHerdr) Read(context.Context, string, string, int) (string, error) { return f.screen, nil }
+func (f *fakeHerdr) Read(context.Context, string, string, int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.screen, nil
+}
 func (f *fakeHerdr) Prompt(_ context.Context, t, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -214,4 +218,54 @@ func TestListAndNew(t *testing.T) {
 	if !strings.Contains(w.all(), "#1 claude") || !strings.Contains(w.all(), "#2 codex") {
 		t.Fatal(w.all())
 	}
+}
+
+const idleScreen = "⏺ all done\n──────────────────────────────\n❯\n──────────────────────────────\n  ~/repo  Opus  ctx:9%\n  ⏵⏵ bypass permissions on · ← 1 agent"
+
+func TestStuckWorkingFallback(t *testing.T) {
+	b, h, w := setup(t)
+	b.StaleAfter, b.ProbeEvery = 0, 0
+	h.set("working", "idle")
+	h.mu.Lock()
+	h.screen = "· Thinking… (3s · esc to interrupt)"
+	h.mu.Unlock()
+	b.Poll(context.Background()) // working, busy screen
+	h.mu.Lock()
+	h.screen = idleScreen
+	h.mu.Unlock()
+	b.Poll(context.Background()) // idle screen seen: arms
+	b.Poll(context.Background()) // unchanged: fires
+	waitFor(t, func() bool { return strings.Contains(w.all(), "已完成") })
+	b.Poll(context.Background()) // must not fire twice
+	h.set("idle", "idle")
+	b.Poll(context.Background()) // herdr catches up: no second post
+	time.Sleep(200 * time.Millisecond)
+	if n := strings.Count(w.all(), "已完成") + strings.Count(w.all(), "已空闲"); n != 1 {
+		t.Fatalf("want exactly one post, got %d:\n%s", n, w.all())
+	}
+	b.OnMessage(wecom.Message{ChatID: "alice", UserID: "alice", Text: "/list"})
+	if !strings.Contains(w.all(), "#1 claude · repo** idle") {
+		t.Fatalf("/list: %s", w.all())
+	}
+}
+
+func TestStuckWorkingRearmsOnActivity(t *testing.T) {
+	b, h, w := setup(t)
+	b.StaleAfter, b.ProbeEvery = 0, 0
+	h.set("working", "idle")
+	b.Poll(context.Background())
+	second := strings.Replace(idleScreen, "all done", "second turn done", 1)
+	show := func(scr string) {
+		h.mu.Lock()
+		h.screen = scr
+		h.mu.Unlock()
+		b.Poll(context.Background())
+	}
+	show(idleScreen)
+	show(idleScreen)
+	waitFor(t, func() bool { return strings.Count(w.all(), "已完成") == 1 })
+	show("· Thinking… (1s · esc to interrupt)")
+	show(second)
+	show(second)
+	waitFor(t, func() bool { return strings.Count(w.all(), "已完成") == 2 })
 }

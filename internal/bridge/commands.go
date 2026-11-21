@@ -209,7 +209,11 @@ func (b *Bridge) listText(chatID string) string {
 		if r := []rune(title); len(r) > 40 {
 			title = string(r[:39]) + "…"
 		}
-		line := fmt.Sprintf("%s **%s** %s%s", statusEmoji(a.Status), b.label(a), a.Status, mark)
+		st := a.Status
+		if st == "working" && b.stalled(a.PaneID) {
+			st = "idle"
+		}
+		line := fmt.Sprintf("%s **%s** %s%s", statusEmoji(st), b.label(a), st, mark)
 		if title != "" {
 			line += "\n　　" + title
 		}
